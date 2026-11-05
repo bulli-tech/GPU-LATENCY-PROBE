@@ -1,97 +1,94 @@
-# GPU-CHECKUP
+# GPU-LATENCY-PROBE
 
-Detect one of the most deceptive GPU server problems: a **degraded GSP
-channel** — the path to the management processor that runs inside every
-modern NVIDIA GPU.
+Find out why a GPU server is slow when nothing in `nvidia-smi` looks wrong.
 
-The symptom looks like this: `nvidia-smi` reports normal temperature, power and
-utilization, there are no errors in the logs, yet training and inference are
-several times slower than they should be. The culprit is neither your code nor
-your framework nor the driver version — it is the card.
+This tool measures the **cost of a CUDA API call** and how that cost behaves
+under the two conditions every real workload has: idle gaps between calls, and
+several threads touching the same card. On a healthy GPU the cost is a few
+microseconds in every case. On an affected GPU it is fine in a tight loop and
+falls apart everywhere else — which is exactly why the problem survives months
+of investigation.
 
-`GSP-CHECKUP.py` finds this in a single run and tells you plainly which cards
-are healthy and which are not.
+## The short version
 
-## What we ran into
+- A GPU can report normal clocks, power, temperature and zero errors while every
+  call from your process costs hundreds of microseconds instead of two.
+- The penalty is almost invisible to a tight-loop benchmark. It appears when
+  calls are **spaced out**, as they are between inference steps.
+- It gets dramatically worse under **concurrent access** to the same card: a
+  couple of threads turn microseconds into milliseconds or seconds, and can park
+  a process in uninterruptible sleep.
+- **A layout with one worker process per card often runs fine anyway.** That is
+  why `pipeline_parallel=8` looked healthy on the same machine where tensor
+  parallel 4 + expert parallel 4 crawled.
 
-A server with 8×A100-SXM4-40GB ran a DeepSeek-V4.1 model under vLLM at 1.9 tok/s
-instead of 200+. The profiler showed stalls of 0.65–2.85 seconds on ranks 1 and
-2, while ranks 0 and 3 showed 0.2 ms. It looked like "NCCL is waiting", "the
-host callback is slow", "the allocator is the problem".
+## The incident behind this tool
 
-What we tried, and what did not help:
+8× A100-SXM4-40GB, vLLM, TP=4 + EP=4, DeepSeek V4.1: **1.9 tok/s instead of
+200+**. Profiler traces showed multi-second stalls on two of four ranks while
+the other two were fine. Every layer of the stack was suspected in turn:
+expert-offload kernels, the pinned allocator, the engram host callback, NCCL.
 
-- found and fixed real bugs in the expert-offload kernels — throughput unchanged;
-- disabled the background thread of the pinned allocator — the stall moved but
-  the speed did not improve;
-- isolated NCCL tests: a small AllGather took 55 µs, perfectly normal;
-- isolated empty host callbacks: 0.07–0.5 ms, far from seconds;
-- switched the driver 610.57.04 → 580.196.07 (CUDA 13.3 → 13.0) — not a single
-  number changed.
+All of it was downstream of one fact: **some of the cards degrade when the driver
+is accessed concurrently**. The same machine ran a different engine with
+pipeline parallel 8 — one worker process, and therefore one driver channel, per
+card — at full speed. That layout never triggers the collapse.
 
-What it actually was: **the machine was populated from two different batches of
-the same GPU model**. Three cards were fine, five were not.
+Measured on that machine:
 
-| GPUs | Board Part Number | VBIOS | State |
-|------|-------------------|-------|-------|
-| 0, 3, 7 | 692-2G506-0200-**002** | 92.00.**36**.00.04 | healthy |
-| 1, 2, 4, 5, 6 | 692-2G506-0200-**000** | 92.00.**0C**.00.05 | degraded |
+| Card group | tight loop | spaced 10 ms | 1 loader thread | 4 loader threads |
+|---|---|---|---|---|
+| healthy (0, 3, 7) | 2.1–2.5 µs | 13.5 µs | 3.7–4.9 µs | 8.3–18.8 µs |
+| affected (1, 2, 4, 5, 6) | 2.0–2.5 µs | 13.4 µs | 1347–1377 µs | 170–173 µs |
 
-The split matched the measurements 8 out of 8, with no exceptions. On the
-degraded cards every CUDA API call cost ~160 µs instead of ~2 µs, and under
-load it stretched into seconds. The kernel log showed `Xid 119` — a timeout
-while waiting for a reply from the GSP.
+Note the first two columns: at rest and even after idle gaps **every card looks
+identical**. The split appears only under concurrency. That is the trap — and it
+is why a single-threaded benchmark proves nothing.
 
-## Quick start
+The affected cards also grouped by hardware revision, 8 of 8:
+
+| GPUs | Board Part Number | VBIOS |
+|---|---|---|
+| 0, 3, 7 | 692-2G506-0200-**002** | 92.00.**36**.00.04 |
+| 1, 2, 4, 5, 6 | 692-2G506-0200-**000** | 92.00.**0C**.00.05 |
+
+The kernel log contained `Xid 119` (GSP RPC timeout) on an affected card — but
+only after a stress test. It is a consequence, not the cause.
+
+## Usage
 
 ```bash
-# no arguments: prompts for a choice when several cards are present
-python3 GSP-CHECKUP.py
-
-# every card
-python3 GSP-CHECKUP.py --all
-
-# list the cards only
-python3 GSP-CHECKUP.py --list
-
-# specific cards
-python3 GSP-CHECKUP.py -d 0 -d 3
-
-# more loader threads for the loaded phase (default 4)
-python3 GSP-CHECKUP.py --all --threads 8
+python3 latency_probe.py                  # prompts for a choice when several cards exist
+python3 latency_probe.py --all            # every card
+python3 latency_probe.py -d 0 -d 3        # specific cards
+python3 latency_probe.py --list           # list cards only
+python3 latency_probe.py --gap 0.01       # idle gap for the spaced test, seconds
+python3 latency_probe.py --threads 1,2,4  # thread counts to sweep
 ```
 
-The script is dependency-free: only the Python standard library plus
-`libcudart`, which ships with the driver. No weights, no models, nothing to
-download.
+No dependencies: Python standard library plus `libcudart`, which ships with the
+driver.
 
-## What it prints
+### Output
 
 ```
-Checking 8 card(s)  (loader threads: 4)
-Delay is the median of a single cudaEventQuery call, microseconds.
+Probing 8 card(s)  (gap 10 ms, threads 1,2,4)
+Values: median cost of one cudaEventQuery, microseconds.
 
-  # model                           cold     warm     loaded  verdict
-------------------------------------------------------------------------------
-  0 NVIDIA A100-SXM4-40GB             2.5      2.5       22.8  OK
-  1 NVIDIA A100-SXM4-40GB             2.5      2.2      172.0  BAD
-  2 NVIDIA A100-SXM4-40GB             2.3      2.2      172.2  BAD
-  3 NVIDIA A100-SXM4-40GB             2.2      2.2        9.0  OK
-  4 NVIDIA A100-SXM4-40GB             2.1      2.1      156.7  BAD
-  5 NVIDIA A100-SXM4-40GB             2.5      2.0      172.6  BAD
-  6 NVIDIA A100-SXM4-40GB             2.1      2.1      158.6  BAD
-  7 NVIDIA A100-SXM4-40GB             2.1      2.7        7.7  OK
-------------------------------------------------------------------------------
+  # model                       tight   spaced      1thr      4thr  verdict
+---------------------------------------------------------------------------
+  0 NVIDIA A100-SXM4-40GB         2.4     13.7       4.9      18.8  OK
+  1 NVIDIA A100-SXM4-40GB         2.1     13.5    1347.7     170.0  CONTENTION
+  3 NVIDIA A100-SXM4-40GB         2.1     13.5       4.5       9.8  OK
+  7 NVIDIA A100-SXM4-40GB         2.5     13.6       3.7       8.3  OK
+---------------------------------------------------------------------------
 
 Healthy (3): GPU 0, GPU 3, GPU 7
-Degraded GSP (5): GPU 1, GPU 2, GPU 4, GPU 5, GPU 6
+Problem (5): GPU 1, GPU 2, GPU 4, GPU 5, GPU 6
 ```
 
-Exit code is `0` when every card is healthy, `1` when any card is degraded,
-`2` when the environment is not usable (no driver, no GPUs).
-
-If something is missing, the script says exactly what instead of failing with a
-stack trace:
+Exit code: `0` all healthy, `1` problems found, `2` cannot run (no driver, no
+GPUs). If something is missing the tool says exactly what:
 
 ```
 CANNOT RUN: missing components
@@ -101,125 +98,103 @@ CANNOT RUN: missing components
     check: ls /usr/local/cuda/lib64/libcudart.so*
 ```
 
-## How the measurement works
+## What is measured, exactly
 
-1. **Environment check.** The script verifies it can run at all: `libcudart`
-   is resolvable, `cudaGetDeviceCount` returns at least one device. Otherwise
-   it explains what is missing and exits `2`.
+A CUDA event is recorded on a stream and that stream is synchronized. The event
+is now **complete and stays complete**. Every later `cudaEventQuery` on it waits
+for nothing on the GPU — it only asks the driver for a status. The elapsed CPU
+wall time is therefore the cost of the call itself, not of any work.
 
-2. **Cold pass.** For each device it creates a stream and an event, then times
-   `cudaEventQuery` on that event in a tight loop, 30 samples. No memory has
-   been touched yet, so the GSP channel is cold.
+Three measurements per card:
 
-3. **Warm pass.** `cudaMalloc` of 1 MiB plus a `cudaMemsetAsync` and an event
-   record. The event is now complete and stays complete, so every later query
-   returns at once — the numbers reflect the cost of the call, not the work.
-   100 samples.
+1. **tight** — 100 back-to-back calls. Keeps the driver path warm, so this is
+   the best case and is nearly always fine, even on bad cards.
+2. **spaced** — 60 calls with `--gap` seconds between them (default 10 ms). Each
+   call pays the wake-up cost of the path, which is what inference sees between
+   steps.
+3. **loaded** — the tight loop repeated while `--threads` loader threads keep
+   the same card busy on their own streams. Calls serialize on a driver lock;
+   this is the column that separates good cards from bad ones.
 
-4. **Loaded pass.** `--threads` worker threads each own their stream and keep
-   the card busy with `cudaMemsetAsync` + `cudaStreamSynchronize`, while the
-   main thread keeps querying. Under this contention the driver must serialize
-   calls onto the device channel; a degraded GSP cannot keep up and the median
-   climbs by orders of magnitude. 50 samples.
+A wall-clock budget stops any phase, so a frozen card cannot hang the tool. When
+the budget runs out the card is reported `STALLED`, which is itself the finding.
 
-5. **Verdict.** `OK` if both `warm` and `loaded` are below `HEALTHY_US`
-   (30 µs). `BAD` if `warm` or `loaded` exceeds `BAD_US` (100 µs). Otherwise
-   `WARN`. The ratio between a healthy and a degraded card is roughly 70×,
-   so the thresholds are not sensitive to minor noise.
+The baseline for the relative test is the cheapest `loaded` number among the
+probed cards. Comparing cards against each other is far more reliable than an
+absolute threshold: spread between good cards is a few microseconds while a bad
+card is hundreds of times worse.
 
-All numbers are CPU-side wall clock (`perf_counter_ns`), median per phase.
+### Note on cudaMalloc
 
-### Why a completed event
+Allocation happens **after** the first timing, never before. Allocation itself
+goes through the driver path; doing it first warms the channel and hides the
+effect. This was found the hard way: the first version of this tool reported a
+healthy 2 µs on a card that costs 200 µs when idle.
 
-`cudaEventQuery` on an already-complete event waits for nothing on the GPU.
-It still has to reach the driver and, on the paths that involve it, the GSP.
-That is precisely the cost we want to isolate: if the call takes 160 µs instead
-of 2 µs while doing no work, the time is spent in the driver-to-GSP path.
+## Verdicts
 
-### Why `cudaMalloc` is not the first call
-
-`cudaMalloc` itself goes through the GSP, so calling it before the cold pass
-would warm the channel and the cold number would lose its meaning. We measured
-this the hard way: the first version reported a healthy 2 µs on a degraded card
-because the allocation had already primed it.
-
-## Interpretation
-
-| Observation | Meaning |
+| Verdict | Meaning |
 |---|---|
-| `warm` ≈ 1–3 µs on every card | Normal. The GSP answers in microseconds. |
-| `warm` > 100 µs consistently | The channel is degraded even when idle. |
-| `warm` normal, `loaded` > 100 µs | The channel collapses under concurrency — the throughput killer. |
-| `cold` high, `warm` low | Cold start of the channel, not a defect. |
-| Wide spread across cards | Mixed batches or revisions. Compare `Board Part Number` and `VBIOS`. |
+| `OK` | Cheap back-to-back, after idle gaps, and under threads. |
+| `WARN` | Wake-up after idle is elevated but nothing collapses. Re-check on an idle machine. |
+| `SLOW` | Even back-to-back calls are expensive. Every call pays a tax. |
+| `DEGRADED` | An idle gap makes the next call cost hundreds of microseconds. |
+| `CONTENTION` | A few threads turn the call into milliseconds — calls serialize on a driver lock. |
+| `STALLED` | Calls were so slow the sample budget ran out; the card effectively froze. |
 
-## What to check when the script reports BAD
+## What to do with the result
 
-```bash
-# compare revisions across cards
-for i in 0 1 2 3 4 5 6 7; do
-  echo "=== GPU$i ==="
-  nvidia-smi -i $i -q | grep -E "Serial Number|VBIOS Version|Board Part Number"
-done
+If some cards are `DEGRADED`, `CONTENTION` or `STALLED`:
 
-# look for GSP timeouts in the kernel log
-sudo dmesg -T | grep -E "Xid|GSP" | tail -20
-```
+1. **Group by hardware revision.** This is the fastest confirmation of a batch
+   problem:
 
-What the findings mean:
+   ```bash
+   for i in 0 1 2 3 4 5 6 7; do
+     echo "=== GPU$i ==="
+     nvidia-smi -i $i -q | grep -E "Serial Number|VBIOS Version|Board Part Number"
+   done
+   ```
 
-- **different `VBIOS Version` or `Board Part Number` between healthy and
-  affected cards** — two batches; update the VBIOS on the older ones or keep
-  them out of production;
-- **`Xid 119` in dmesg** — the driver timed out waiting for a GSP reply. This is
-  a consequence of the same degradation, not a separate failure;
-- **identical revisions but different behaviour** — then look at power and
-  cooling for that specific slot; that is a different investigation.
+2. **Check the kernel log** for GSP timeouts:
 
-## Should I trust the number?
+   ```bash
+   sudo dmesg -T | grep -E "Xid|GSP" | tail -20
+   ```
 
-The script measures what the driver actually does, not what vendor tools report.
-`nvidia-smi` samples utilization over time windows and will happily show a card
-as busy while every call takes 150 µs to submit.
+   `Xid 119` means the driver timed out waiting for the GSP. It confirms the
+   driver path is in trouble but does not say why.
 
-For a second opinion, compare against a known-good card in the same machine:
+3. **Restructure the workload: one worker process per card.** A layout that
+   gives each card its own process and its own driver channel (pipeline
+   parallel, or tensor parallel with separate workers) keeps one channel busy
+   and usually avoids the collapse entirely, even on affected cards. This is the
+   only free workaround, and on our machine it was the difference between
+   1.9 tok/s and full speed for another engine.
 
-```bash
-python3 GSP-CHECKUP.py -d 0   # known-good
-python3 GSP-CHECKUP.py -d 1   # suspect
-```
+4. **Do not assume a driver upgrade fixes it.** Switching 610.57.04 → 580.196.07
+   changed nothing in our case. Disabling the GSP path with
+   `NVreg_EnableGpuFirmware=0` is not honoured on this hardware either: the
+   module loads, but GSP stays active.
 
-A factor of two is noise. A factor of fifty is a defective card or batch.
+5. **Be careful with stress tests on affected cards.** Pushing several threads
+   at them can drive the driver into a lock held by a thread stuck waiting for
+   GSP; `nvidia-smi` then blocks too and processes sit in `D` state. If that
+   happens, unload and reload the modules rather than killing processes.
 
-## Inside a container
+## Caveats
 
-Mount the script and run it with all GPUs visible:
-
-```bash
-docker run --rm --gpus all -v "$PWD/GSP-CHECKUP.py:/tmp/g.py:ro" \
-  <image with python and cudart> -I /tmp/g.py --all
-```
-
-Note that `--gpus device=N` renumbers devices: inside the container the card
-becomes index 0. Use `--gpus all` so the indices match the host.
-
-## Requirements
-
-- Linux, Python 3.8+.
-- NVIDIA driver providing `libcudart`.
-- No root required for the measurement itself.
-
-## Limitations
-
-- The script measures the symptom, not the root cause. `BAD` means "the path to
-  the GSP has degraded"; why it degraded is answered by comparing revisions,
-  reading the kernel log, and talking to the vendor.
-- Thresholds (`HEALTHY_US = 30`, `BAD_US = 100`) were tuned on A100. On other
-  architectures, run it once on a card you know is good and look at `warm`.
-- If the card is busy with another job, `loaded` will be inflated. Measure on an
-  idle system.
+- The measurement is relative, not calibrated. Compare cards within one machine,
+  not against absolute numbers from another machine.
+- Run it on a quiet machine. Load on the same card inflates the `loaded` column
+  (intended); load on the CPU inflates everything.
+- Thresholds were tuned on A100. On other architectures, run it on a card you
+  trust and read `tight` and `spaced` directly instead of trusting the verdict.
 - A card in `EXCLUSIVE_PROCESS` compute mode may refuse a second context; the
-  script reports the error, which is expected.
+  tool reports the error, which is expected.
+- The tool measures a symptom, not a root cause. It tells you **which cards**
+  and **which access pattern** to avoid. Why a card behaves this way is a
+  hardware/vendor question.
 
 ## License
 
