@@ -55,6 +55,17 @@ The affected cards also grouped by hardware revision, 8 of 8:
 The kernel log contained `Xid 119` (GSP RPC timeout) on an affected card — but
 only after a stress test. It is a consequence, not the cause.
 
+**The actual cause was the kernel module variant.** The driver was installed as
+the *open* modules (`license: Dual MIT/GPL`), and with those the GSP firmware is
+mandatory — `NVreg_EnableGpuFirmware=0` is accepted but ignored. After switching
+to the **proprietary** modules with GSP disabled (`license: NVIDIA`,
+`GSP Firmware Version: N/A`), the affected cards went from 1347–1377 µs to
+**4.5–5.4 µs**: all eight cards healthy, no hardware replacement needed.
+
+Read [CASE-STUDY.md](CASE-STUDY.md) for the full investigation: what was
+suspected, what was ruled out, the exact fix, and the traps encountered while
+building kernel modules on this host.
+
 ## Usage
 
 ```bash
@@ -172,10 +183,21 @@ If some cards are `DEGRADED`, `CONTENTION` or `STALLED`:
    only free workaround, and on our machine it was the difference between
    1.9 tok/s and full speed for another engine.
 
-4. **Do not assume a driver upgrade fixes it.** Switching 610.57.04 → 580.196.07
-   changed nothing in our case. Disabling the GSP path with
-   `NVreg_EnableGpuFirmware=0` is not honoured on this hardware either: the
-   module loads, but GSP stays active.
+4. **Check the kernel module variant first.** This is the highest-value check
+   and the one we missed for a long time:
+
+   ```bash
+   modinfo nvidia | grep -i license
+   # NVIDIA       -> proprietary, NVreg_EnableGpuFirmware=0 works
+   # Dual MIT/GPL -> open, GSP stays active whatever you set
+   ```
+
+   With the proprietary modules and `NVreg_EnableGpuFirmware=0`, every affected
+   card in our case became healthy. See [CASE-STUDY.md](CASE-STUDY.md) for the
+   procedure, including the initramfs step that makes it survive a reboot.
+
+   Note that a *driver version* change does not help: 610.57.04 → 580.196.07
+   changed nothing, because the module variant stayed `open`.
 
 5. **Be careful with stress tests on affected cards.** Pushing several threads
    at them can drive the driver into a lock held by a thread stuck waiting for
