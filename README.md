@@ -62,6 +62,14 @@ to the **proprietary** modules with GSP disabled (`license: NVIDIA`,
 `GSP Firmware Version: N/A`), the affected cards went from 1347–1377 µs to
 **4.5–5.4 µs**: all eight cards healthy, no hardware replacement needed.
 
+End to end, on the same protocol and the same weights:
+
+| Concurrency | Before | After |
+|---|---|---|
+| 1 | 1.93 tok/s | **33.20 tok/s** |
+| 4 | 3.90 tok/s | **78.96 tok/s** |
+| 8 | 7.07 tok/s | **110.75 tok/s** |
+
 Read [CASE-STUDY.md](CASE-STUDY.md) for the full investigation: what was
 suspected, what was ruled out, the exact fix, and the traps encountered while
 building kernel modules on this host.

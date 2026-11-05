@@ -105,6 +105,28 @@ And the collapse disappears:
 | healthy (0, 3, 7) | 3.7–4.9 µs | 4.7–4.9 µs |
 | affected (1, 2, 4, 5, 6) | **1347–1377 µs** | **4.5–5.4 µs** |
 
+### What this did to end-to-end throughput
+
+Same protocol before and after, same prompt, same engine build, same weights.
+Protocol: one fixed prompt, `max_tokens=64`, `temperature=0`, `seed=42`,
+`ignore_eos=true`, SSE, one warmup plus five measurements per concurrency,
+metric = output tokens / wall time of the series.
+
+| Concurrency | Before (open, GSP on) | After (proprietary, GSP off) | Speedup |
+|---|---|---|---|
+| 1 | 1.93 tok/s | **33.20 tok/s** | 17x |
+| 4 | 3.90 tok/s | **78.96 tok/s** | 20x |
+| 8 | 7.07 tok/s | **110.75 tok/s** | 16x |
+
+Spread across the five runs per cell was under 1% (33.12–33.30, 78.73–79.06,
+110.66–110.76). Time to first token 0.379 s. Response text was identical
+(`text_sha256`) across repeats, so the fix is purely about the driver path and
+does not change model output.
+
+The remaining gap to 200+ tok/s is now an engine-configuration question
+(speculative decoding, expert offload, batch sizing), not a hardware or driver
+one — the driver no longer appears in the profile at all.
+
 ## 5. The hardware detail that is real but secondary
 
 The cards group perfectly by production batch, 8 of 8:
