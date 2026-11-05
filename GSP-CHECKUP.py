@@ -1,42 +1,41 @@
 #!/usr/bin/env python3
 """
-GSP-CHECKUP — быстрая проверка, здоров ли GSP-процессор на GPU.
+GSP-CHECKUP — quick check whether the GSP processor on an NVIDIA GPU is healthy.
 
-Что это и зачем
----------------
-В современных NVIDIA-драйверах управление картой выполняет не только host-CPU,
-но и GSP (GPU System Processor) — небольшой процессор на самой карте.
-Драйвер общается с ним через RPC. Если этот канал работает нормально, любой
-вызов CUDA API (cudaEventQuery, cudaStreamQuery, cudaMemcpyAsync ...) стоит
-единицы микросекунд. Если канал деградировал — те же вызовы стоят сотни
-микросекунд, а под нагрузкой уходят в секунды, потому что запросы встают в
-очередь к GSP.
+What this is and why
+--------------------
+On modern NVIDIA GPUs the driver talks to the GSP (GPU System Processor), a small
+processor on the card itself, over RPC. When that channel is healthy, any CUDA API
+call (cudaEventQuery, cudaStreamQuery, cudaMemcpyAsync, ...) costs a few
+microseconds. When the channel has degraded, the same calls cost hundreds of
+microseconds, and under load they stretch into seconds because requests queue up
+in front of the GSP.
 
-Именно это выглядит как "медленная карта": обучение и инференс замедляются в
-разы, при этом nvidia-smi показывает нормальную температуру, питание и
-загрузку, а ошибок в логах может не быть вовсе.
+This is what a "slow GPU" looks like in practice: training and inference get
+many times slower, while nvidia-smi reports normal temperature, power and
+utilization, and the logs may contain no errors at all.
 
-Как проверяем
--------------
-Измеряем время одного вызова cudaEventQuery на событии, которое уже завершено.
-Вызов ничего не ждёт на GPU: он лишь спрашивает состояние. Значит всё время
-сверх нормы — это стоимость пути CPU -> драйвер -> GSP.
+How we measure
+--------------
+We time a single cudaEventQuery call on an event that has already completed.
+The call waits for nothing on the GPU: it only asks for a status. So every
+microsecond above normal is the cost of the path CPU -> driver -> GSP.
 
-Три режима, потому что они дают разные числа:
-  cold   — сразу после создания контекста (у некоторых карт 150-200 мкс)
-  warm   — после того, как на карте выполнена работа
-  loaded — пока карту держат несколько потоков
+Three modes, because they produce different numbers:
+  cold   — right after context creation (some healthy cards show 150-200 us here)
+  warm   — after the card has done real work
+  loaded — while several threads keep the card busy
 
-Запуск
-------
-    python3 GSP-CHECKUP.py              # если карт несколько — спросит выбор
-    python3 GSP-CHECKUP.py --all        # все карты
-    python3 GSP-CHECKUP.py --list       # только перечислить
-    python3 GSP-CHECKUP.py -d 0 -d 2    # конкретные карты
-    python3 GSP-CHECKUP.py --threads 8  # сколько потоков в режиме loaded
+Usage
+-----
+    python3 GSP-CHECKUP.py              # prompts for a choice when several cards exist
+    python3 GSP-CHECKUP.py --all        # every card
+    python3 GSP-CHECKUP.py --list       # list cards only
+    python3 GSP-CHECKUP.py -d 0 -d 2    # specific cards
+    python3 GSP-CHECKUP.py --threads 8  # loader threads for the loaded mode
 
-Зависимостей нет: только стандартная библиотека Python и libcudart, которая
-уже стоит вместе с драйвером. Никаких весов, моделей и загрузок.
+No dependencies: Python standard library plus libcudart, which ships with the
+NVIDIA driver. No weights, no models, nothing to download.
 """
 
 from __future__ import annotations
@@ -45,26 +44,25 @@ import argparse
 import ctypes
 import ctypes.util
 import os
-import statistics
 import sys
 import threading
 import time
 
 # ---------------------------------------------------------------------------
-# Пороги. Подобраны по живым измерениям: исправная A100 даёт ~2 мкс,
-# карта с деградировавшим GSP — 150-180 мкс, то есть в 70 раз хуже.
+# Thresholds, in microseconds. Derived from live measurements: a healthy A100
+# answers in ~2 us, a card with a degraded GSP in 150-180 us, i.e. ~70x worse.
 # ---------------------------------------------------------------------------
-HEALTHY_US = 30.0        # warm/loaded p50 ниже этого — карта здорова
-BAD_US = 100.0           # выше этого — GSP деградировал
-SAMPLES = 100            # сколько измерений делаем для медианы
+HEALTHY_US = 30.0        # warm/loaded p50 below this: card is healthy
+BAD_US = 100.0           # above this: GSP has degraded
+SAMPLES = 100            # measurements per median
 
 
 # ---------------------------------------------------------------------------
-# Проверка окружения: без этого скрипт не может работать, и лучше сказать
-# об этом прямо, чем падать с невнятной ошибкой.
+# Environment checks. Without these the script cannot run, and it is better to
+# say so plainly than to fail with an obscure error.
 # ---------------------------------------------------------------------------
 def _candidate_libs() -> list[str]:
-    """Где искать libcudart. Порядок важен: сначала системный линкер."""
+    """Where to look for libcudart. Order matters: the system linker first."""
     found: list[str] = []
     guess = ctypes.util.find_library("cudart")
     if guess:
@@ -82,15 +80,15 @@ def _candidate_libs() -> list[str]:
 
 
 def load_runtime():
-    """Загрузить libcudart и объявить сигнатуры. Возвращает объект или None."""
+    """Load libcudart and declare the signatures. Returns (lib or None, problems)."""
     problems: list[str] = []
     libs = _candidate_libs()
     if not libs:
         problems.append(
-            "не найдена библиотека libcudart\n"
-            "  Linux: она лежит рядом с драйвером или в CUDA toolkit\n"
-            "    проверьте: ls /usr/local/cuda/lib64/libcudart.so* \n"
-            "    или установите toolkit: https://developer.nvidia.com/cuda-downloads"
+            "libcudart not found\n"
+            "  Linux: it ships with the driver and with the CUDA toolkit\n"
+            "    check: ls /usr/local/cuda/lib64/libcudart.so*\n"
+            "    or install the toolkit: https://developer.nvidia.com/cuda-downloads"
         )
         return None, problems
 
@@ -100,13 +98,14 @@ def load_runtime():
             lib = ctypes.CDLL(name)
             break
         except OSError as exc:
-            problems.append(f"не удалось загрузить {name}: {exc}")
+            problems.append(f"failed to load {name}: {exc}")
 
     if lib is None:
         return None, problems
 
-    # Сигнатуры объявляем явно: иначе ctypes передаст int вместо указателя
-    # и получим порчу памяти вместо ответа.
+    # Declare signatures explicitly. Without this ctypes passes a Python int
+    # where a pointer is expected, and we corrupt memory instead of getting
+    # an answer.
     lib.cudaSetDevice.argtypes = [ctypes.c_int]
     lib.cudaSetDevice.restype = ctypes.c_int
     lib.cudaGetDeviceCount.argtypes = [ctypes.POINTER(ctypes.c_int)]
@@ -114,9 +113,10 @@ def load_runtime():
     lib.cudaDeviceSynchronize.restype = ctypes.c_int
     lib.cudaGetErrorString.argtypes = [ctypes.c_int]
     lib.cudaGetErrorString.restype = ctypes.c_char_p
+    lib.cudaGetLastError.restype = ctypes.c_int
 
-    lib.cudaStreamCreate.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
     lib.cudaStreamCreate.restype = ctypes.c_int
+    lib.cudaStreamCreate.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
     lib.cudaStreamDestroy.argtypes = [ctypes.c_void_p]
     lib.cudaStreamDestroy.restype = ctypes.c_int
     lib.cudaStreamSynchronize.argtypes = [ctypes.c_void_p]
@@ -144,36 +144,36 @@ def load_runtime():
 
 
 def check_environment(lib, problems: list[str]) -> tuple[bool, int]:
-    """Проверить, что карты вообще видны. Возвращает (ok, количество карт)."""
+    """Verify that any card is visible at all. Returns (ok, device count)."""
     if lib is None:
-        print("НЕ МОЖНО ЗАПУСТИТЬ: не хватает компонентов\n")
+        print("CANNOT RUN: missing components\n")
         for p in problems:
-            print(f"  • {p}")
-        print("\nУстановите драйвер NVIDIA (он приносит libcudart и устройства).")
+            print(f"  - {p}")
+        print("\nInstall the NVIDIA driver; it provides libcudart and the devices.")
         return False, 0
 
     count = ctypes.c_int(0)
     rc = lib.cudaGetDeviceCount(ctypes.byref(count))
     if rc != 0:
         msg = lib.cudaGetErrorString(rc).decode(errors="replace")
-        print("НЕ МОЖНО ЗАПУСТИТЬ: CUDA не видит устройств\n")
-        print(f"  • cudaGetDeviceCount вернул: {msg}")
-        print("  • проверьте: nvidia-smi, права доступа к /dev/nvidia*,")
-        print("    переменную CUDA_VISIBLE_DEVICES")
+        print("CANNOT RUN: CUDA sees no devices\n")
+        print(f"  - cudaGetDeviceCount returned: {msg}")
+        print("  - check: nvidia-smi, access to /dev/nvidia*,")
+        print("    the CUDA_VISIBLE_DEVICES variable")
         return False, 0
 
     if count.value == 0:
-        print("НЕ МОЖНО ЗАПУСТИТЬ: в системе нет доступных GPU\n")
-        print("  • nvidia-smi должен показывать карты")
-        print("  • в контейнере нужен --gpus all")
+        print("CANNOT RUN: no usable GPU in this system\n")
+        print("  - nvidia-smi must list the cards")
+        print("  - inside a container you need --gpus all")
         return False, 0
 
     return True, count.value
 
 
 # ---------------------------------------------------------------------------
-# Имена карт. Через runtime их не взять, поэтому спрашиваем nvidia-smi.
-# Если его нет — не страшно, покажем индекс.
+# Card names. The runtime API does not expose them, so we ask nvidia-smi.
+# Without it we simply show the index.
 # ---------------------------------------------------------------------------
 def device_names(count: int) -> list[str]:
     names = [f"GPU {i}" for i in range(count)]
@@ -185,7 +185,7 @@ def device_names(count: int) -> list[str]:
         out = subprocess.run([smi, "-L"], capture_output=True, text=True, timeout=20)
         for line in out.stdout.splitlines():
             line = line.strip()
-            # формат: "GPU 0: NVIDIA A100-SXM4-40GB (UUID: GPU-...)"
+            # format: "GPU 0: NVIDIA A100-SXM4-40GB (UUID: GPU-...)"
             if not line.startswith("GPU ") or ": " not in line:
                 continue
             idx_part, rest = line.split(": ", 1)
@@ -210,10 +210,10 @@ def _find_nvidia_smi() -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Измерения
+# Measurement
 # ---------------------------------------------------------------------------
 class Device:
-    """Одна карта: контекст, поток, событие, буфер."""
+    """One card: stream, event, buffer."""
 
     def __init__(self, lib, index: int):
         self.lib = lib
@@ -223,32 +223,35 @@ class Device:
         self.buffer = ctypes.c_void_p()
 
     def open(self) -> None:
-        """Создать контекст, поток, событие и один раз дождаться работы.
+        """Create the context, a stream and an event. No work yet.
 
-        Важно: cudaMalloc здесь ВТОРАЯ операция, а не первая. Дело в том, что
-        сама cudaMalloc уже поднимает канал до GSP, и если сделать её первой,
-        замер cold потеряет смысл: он будет мерить уже прогретый канал.
-        Поэтому сначала создаём событие и поток (они не ходят в GSP), снимаем
-        cold, и только потом трогаем память.
+        Note that cudaMalloc is deliberately NOT called here. cudaMalloc itself
+        goes to the GSP, so making it the first call would warm the channel and
+        the "cold" measurement would lose its meaning. So we create only the
+        stream and the event (neither touches the GSP), measure cold, and only
+        then touch memory in warm_up().
         """
         lib = self.lib
         _check(lib, lib.cudaSetDevice(self.index), "cudaSetDevice")
 
         _check(lib, lib.cudaStreamCreate(ctypes.byref(self.stream)), "cudaStreamCreate")
+        # flag 0: no cudaEventBlockingSync, we want a plain poll
         _check(lib, lib.cudaEventCreateWithFlags(ctypes.byref(self.event), 0),
                "cudaEventCreate")
 
     def warm_up(self) -> None:
-        """Первая настоящая работа на карте: аллокация + memset + запись события."""
+        """First real work on the card: allocation, memset, event record."""
         lib = self.lib
+        # 1 MiB is enough that the driver does not collapse it into a stub
+        # allocation, which would not exercise the GSP path.
         _check(lib, lib.cudaMalloc(ctypes.byref(self.buffer), 1 << 20), "cudaMalloc")
         self._record_and_wait()
 
     def _record_and_wait(self) -> None:
-        """Записать событие на потоке и дождаться, пока работа завершится.
+        """Record the event on the stream and wait for the work to finish.
 
-        После этого cudaEventQuery возвращает 'готово' и не ждёт GPU —
-        именно это и позволяет измерить чистую стоимость вызова.
+        After this, cudaEventQuery reports "complete" and waits for nothing on
+        the GPU. That is exactly what lets us time the call itself.
         """
         lib = self.lib
         _check(lib, lib.cudaEventRecord(self.event, self.stream), "cudaEventRecord")
@@ -258,7 +261,7 @@ class Device:
         _check(lib, lib.cudaStreamSynchronize(self.stream), "cudaStreamSynchronize")
 
     def sample(self, n: int = SAMPLES) -> dict:
-        """Медиана времени cudaEventQuery по n замерам, в микросекундах."""
+        """Median cudaEventQuery time over n measurements, in microseconds."""
         lib = self.lib
         query = lib.cudaEventQuery
         ev = self.event
@@ -267,9 +270,9 @@ class Device:
             t0 = time.perf_counter_ns()
             rc = query(ev)
             dt = (time.perf_counter_ns() - t0) / 1000.0
-            if rc not in (0, 1):  # 0 = success, 1 = notReady; иное — ошибка
-                raise RuntimeError(f"cudaEventQuery вернул {rc}: "
-                                   f"{self.errstr(query, ev)}")
+            if rc not in (0, 1):  # 0 = success, 1 = not ready; anything else is an error
+                raise RuntimeError(f"cudaEventQuery returned {rc}: "
+                                   f"{lib.cudaGetErrorString(rc).decode(errors='replace')}")
             xs.append(dt)
         xs.sort()
         return {
@@ -279,10 +282,10 @@ class Device:
         }
 
     def busy_worker(self, stop: threading.Event) -> None:
-        """Держать карту занятой, пока не попросят остановиться.
+        """Keep the card busy until asked to stop.
 
-        Ему нужен СВОЙ контекст-поток: cudaSetDevice привязывает устройство к
-        потоку, поэтому каждый рабочий поток выбирает карту сам.
+        Each worker needs its own device selection: cudaSetDevice binds the
+        device to the calling thread, so every thread picks the card itself.
         """
         lib = self.lib
         lib.cudaSetDevice(self.index)
@@ -309,24 +312,20 @@ class Device:
         if self.buffer:
             lib.cudaFree(self.buffer)
 
-    @staticmethod
-    def errstr(lib, *_):
-        rc = lib.cudaGetLastError() if hasattr(lib, "cudaGetLastError") else -1
-        return lib.cudaGetErrorString(rc).decode(errors="replace")
-
 
 def _check(lib, rc: int, what: str) -> None:
     if rc != 0:
         msg = lib.cudaGetErrorString(rc).decode(errors="replace")
-        raise RuntimeError(f"{what} не удался: {rc} ({msg})")
+        raise RuntimeError(f"{what} failed: {rc} ({msg})")
 
 
 def probe_device(lib, index: int, threads: int) -> dict:
-    """Полный прогон одной карты: cold, warm, loaded."""
+    """Full run on one card: cold, warm, loaded."""
     dev = Device(lib, index)
     dev.open()
     try:
-        # cold снимаем ДО первой памяти: канал до GSP ещё не поднят работой
+        # cold is taken before any memory is touched: the GSP channel is not
+        # warmed up by work yet
         cold = dev.sample(n=30)
         dev.warm_up()
         warm = dev.sample()
@@ -336,7 +335,7 @@ def probe_device(lib, index: int, threads: int) -> dict:
                    for _ in range(threads)]
         for w in workers:
             w.start()
-        time.sleep(1.0)  # дать потокам выйти на режим
+        time.sleep(1.0)  # let the workers reach steady state
         try:
             loaded = dev.sample(n=50)
         finally:
@@ -352,35 +351,34 @@ def probe_device(lib, index: int, threads: int) -> dict:
 
 
 def verdict(row: dict) -> tuple[str, str]:
-    """(короткий статус, объяснение).
+    """Return (short status, explanation).
 
-    Смотрим на warm и loaded. warm — чистый канал до GSP без нашей нагрузки.
-    loaded — то же под конкуренцией потоков; именно он уходит в секунды,
-    когда запросы встают в очередь к GSP.
+    We look at warm and loaded. warm is the clean path to the GSP with no load
+    from us. loaded is the same under thread contention, and that is the number
+    that goes into seconds once requests start queueing in front of the GSP.
     """
     warm = row["warm"]["p50"]
     loaded = row["loaded"]["p50"]
 
     if warm <= HEALTHY_US and loaded <= HEALTHY_US:
-        return "OK", "GSP отвечает быстро и под нагрузкой"
+        return "OK", "GSP answers quickly, including under load"
     if warm > BAD_US:
-        return "BAD", ("каждый вызов CUDA стоит сотни микросекунд — "
-                       "похоже на деградацию канала GSP")
+        return "BAD", ("every CUDA call costs hundreds of microseconds, "
+                       "which points to a degraded GSP channel")
     if loaded > BAD_US:
-        return "BAD", ("в покое терпимо, но под нагрузкой задержка растёт "
-                       "в сотни раз — запросы встают в очередь к GSP")
-    if warm > HEALTHY_US or loaded > HEALTHY_US:
-        return "WARN", "задержка повышена, но не в разы — стоит перепроверить"
+        return "BAD", ("fine at rest, but under load the delay grows hundreds "
+                       "of times over: requests queue in front of the GSP")
+    return "WARN", "delay is elevated but not by orders of magnitude; re-check"
 
 
 # ---------------------------------------------------------------------------
-# Выбор карт
+# Card selection
 # ---------------------------------------------------------------------------
 def choose_devices(count: int, args) -> list[int]:
     if args.devices:
         bad = [d for d in args.devices if not 0 <= d < count]
         if bad:
-            print(f"Нет таких карт: {bad} (доступно 0..{count - 1})")
+            print(f"No such cards: {bad} (available 0..{count - 1})")
             sys.exit(2)
         return sorted(set(args.devices))
     if args.all:
@@ -389,20 +387,20 @@ def choose_devices(count: int, args) -> list[int]:
         return [0]
 
     names = device_names(count)
-    print(f"Найдено карт: {count}\n")
+    print(f"Found cards: {count}\n")
     for i in range(count):
         print(f"  [{i}] {names[i]}")
-    print("\nЧто проверять?")
-    print("  all             — все карты")
-    print("  0,2             — список индексов")
-    print("  0               — одна карта")
-    print("  q               — выйти")
+    print("\nWhat do you want to check?")
+    print("  all             - every card")
+    print("  0,2             - a list of indices")
+    print("  0               - a single card")
+    print("  q               - quit")
     try:
         answer = input("\n> ").strip().lower()
     except EOFError:
         answer = "all"
     if answer in ("q", "quit", "exit", ""):
-        print("Отменено.")
+        print("Cancelled.")
         sys.exit(0)
     if answer == "all":
         return list(range(count))
@@ -411,20 +409,20 @@ def choose_devices(count: int, args) -> list[int]:
         if part.isdigit() and int(part) < count:
             picked.append(int(part))
     if not picked:
-        print("Не понял выбор, беру все карты.")
+        print("Could not parse the choice, using every card.")
         return list(range(count))
     return sorted(set(picked))
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Проверить, здоров ли GSP-процессор на GPU.")
+        description="Check whether the GSP processor on an NVIDIA GPU is healthy.")
     ap.add_argument("-d", "--device", dest="devices", type=int, action="append",
-                    metavar="N", help="индекс карты; можно указать несколько раз")
-    ap.add_argument("--all", action="store_true", help="проверить все карты")
-    ap.add_argument("--list", action="store_true", help="только перечислить карты")
+                    metavar="N", help="device index; may be given several times")
+    ap.add_argument("--all", action="store_true", help="check every card")
+    ap.add_argument("--list", action="store_true", help="list cards only")
     ap.add_argument("--threads", type=int, default=4,
-                    help="потоков в режиме loaded (по умолчанию 4)")
+                    help="loader threads in the loaded mode (default 4)")
     args = ap.parse_args()
 
     lib, problems = load_runtime()
@@ -441,9 +439,9 @@ def main() -> int:
     picked = choose_devices(count, args)
     names = device_names(count)
 
-    print(f"\nПроверяю карт: {len(picked)}  (потоков в нагрузке: {args.threads})")
-    print("Задержка — медиана одного вызова cudaEventQuery, микросекунды.\n")
-    print(f"{'#':>3} {'модель':<28} {'cold':>8} {'warm':>8} {'loaded':>10}  вердикт")
+    print(f"\nChecking {len(picked)} card(s)  (loader threads: {args.threads})")
+    print("Delay is the median of a single cudaEventQuery call, microseconds.\n")
+    print(f"{'#':>3} {'model':<28} {'cold':>8} {'warm':>8} {'loaded':>10}  verdict")
     print("-" * 78)
 
     rows = []
@@ -451,8 +449,8 @@ def main() -> int:
         try:
             row = probe_device(lib, idx, args.threads)
         except Exception as exc:  # noqa: BLE001
-            print(f"{idx:>3} {names[idx]:<28} {'—':>8} {'—':>8} {'—':>10}  "
-                  f"ОШИБКА: {exc}")
+            print(f"{idx:>3} {names[idx]:<28} {'-':>8} {'-':>8} {'-':>10}  "
+                  f"ERROR: {exc}")
             continue
         row["name"] = names[idx]
         status, why = verdict(row)
@@ -465,7 +463,7 @@ def main() -> int:
     print("-" * 78)
 
     if not rows:
-        print("\nНи одну карту проверить не удалось.")
+        print("\nNot a single card could be checked.")
         return 1
 
     bad = [r for r in rows if r["status"] == "BAD"]
@@ -474,33 +472,34 @@ def main() -> int:
 
     print()
     if good:
-        print(f"Здоровы ({len(good)}): "
+        print(f"Healthy ({len(good)}): "
               + ", ".join(f"GPU {r['index']}" for r in good))
     if warn:
-        print(f"Под вопросом ({len(warn)}): "
+        print(f"Questionable ({len(warn)}): "
               + ", ".join(f"GPU {r['index']}" for r in warn))
     if bad:
-        print(f"С деградацией GSP ({len(bad)}): "
+        print(f"Degraded GSP ({len(bad)}): "
               + ", ".join(f"GPU {r['index']}" for r in bad))
 
     print()
     if bad:
-        print("ИТОГ: обнаружены карты, где канал до GSP работает в разы медленнее нормы.")
-        print("      На таких картах обучение и инференс будут тормозить,")
-        print("      даже если nvidia-smi показывает нормальную загрузку.")
-        print("\n      Что делать:")
-        print("        1. сравните VBIOS и Board Part Number у здоровых и больных карт:")
-        print("           nvidia-smi -i N -q | grep -E 'VBIOS|Board Part'")
-        print("        2. если ревизии разные — обновите VBIOS на отстающих")
-        print("        3. исключите больные карты из работы до выяснения")
+        print("RESULT: some cards have a GSP channel that is orders of magnitude")
+        print("        slower than normal. Training and inference will be slow on")
+        print("        them even when nvidia-smi reports healthy utilisation.")
+        print("\n        What to do next:")
+        print("          1. compare VBIOS and Board Part Number across healthy")
+        print("             and affected cards:")
+        print("             nvidia-smi -i N -q | grep -E 'VBIOS|Board Part'")
+        print("          2. if the revisions differ, update the VBIOS on the older ones")
+        print("          3. keep affected cards out of production until resolved")
         return 1
 
     if warn:
-        print("ИТОГ: явной деградации нет, но задержка повышена. Перепроверьте")
-        print("      на простое: возможно, карту занимает другая задача.")
+        print("RESULT: no clear degradation, but the delay is elevated. Re-check on")
+        print("        an idle system: another job may be holding the card.")
         return 1
 
-    print("ИТОГ: все проверенные карты здоровы, GSP отвечает быстро.")
+    print("RESULT: every card checked is healthy, the GSP answers quickly.")
     return 0
 
 
